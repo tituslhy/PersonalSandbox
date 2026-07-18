@@ -28,9 +28,9 @@ Typical usage::
         name="supervisor",
     )
 
-Add middleware that must always be present to :data:`CORE_MIDDLEWARE`. Middleware
-passed to ``create_agent`` is appended to that required stack and is also
-applied to every generated subagent.
+Core middleware in :data:`CORE_MIDDLEWARE` is mandatory. Caller middleware
+passed to ``create_agent`` is additive: it is appended to the required stack
+and applied to every generated subagent.
 
 Important:
     The same middleware objects are supplied to the main agent and its
@@ -68,7 +68,7 @@ ModelLike = str | BaseChatModel
 SystemPrompt = str | SystemMessage | None
 
 
-# Add middleware that must always run on every  agent here.
+# Add middleware that must always run on every agent here.
 #
 # Example:
 #
@@ -93,11 +93,14 @@ _RESERVED_AGENT_KWARGS = frozenset(
     }
 )
 
+
 class SubAgentSpec(BaseModel):
     """Declarative configuration for a generated LangChain subagent.
-    The  shim creates the subagent with LangChain's ``create_langchain_agent``,
+
+    The shim creates the subagent with LangChain's ``create_langchain_agent``,
     injects the shared and subagent-specific middleware, and exposes the
     resulting agent as a tool to the main agent.
+
     Attributes:
         name:
             Name used for the generated LangChain agent and subagent tool.
@@ -111,7 +114,7 @@ class SubAgentSpec(BaseModel):
         tools:
             Tools available only to this subagent.
         middleware:
-            Middleware applied only to this subagent, after the shared 
+            Middleware applied only to this subagent, after the shared
             middleware stack.
         agent_kwargs:
             Additional keyword arguments forwarded to LangChain's
@@ -130,7 +133,7 @@ class SubAgentSpec(BaseModel):
     # Use True to inherit the parent graph's checkpointer when this subagent is
     # invoked as a tool.
     checkpointer: Checkpointer = None
-    agent_kwargs: dict[str, Any] = Field(default_factory=dict)    
+    agent_kwargs: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("name", "description")
     @classmethod
@@ -155,8 +158,10 @@ class SubAgentSpec(BaseModel):
             )
         return self
 
+
 def _normalize_name(name: str) -> str:
     """Convert an arbitrary agent name into a safe snake-case identifier.
+
     Args:
         name:
             Raw human-readable name.
@@ -175,6 +180,7 @@ def _normalize_name(name: str) -> str:
     if normalized[0].isdigit():
         normalized = f"agent_{normalized}"
     return normalized
+
 
 def _combine_middleware(
     *groups: Sequence[AgentMiddleware],
@@ -233,6 +239,7 @@ def _create_subagent(
         **dict(spec.agent_kwargs),
     )
 
+
 def wrap_subagent_as_tool(
     spec: SubAgentSpec,
     subagent: CompiledStateGraph,
@@ -290,6 +297,7 @@ def wrap_subagent_as_tool(
         description=spec.description,
     )
 
+
 def _validate_unique_tool_names(tools: Sequence[BaseTool]) -> None:
     """Raise when ordinary and generated tools expose duplicate names."""
     seen: set[str] = set()
@@ -313,10 +321,10 @@ def merge_tools_and_subagents(
 ) -> list[BaseTool]:
     """Create subagents, wrap them as tools, and merge them with normal tools.
 
-    Subagents are created with LangChain's native ``create_langchain_agent`` rather than
-    recursively calling ``create_agent``. This keeps the public shim thin
-    while still guaranteeing that the supplied middleware is installed on
-    every generated subagent.
+    Subagents are created with LangChain's native ``create_langchain_agent``
+    rather than recursively calling ``create_agent``. This keeps the public
+    shim thin while still guaranteeing that the supplied middleware is
+    installed on every generated subagent.
 
     Args:
         tools:
@@ -354,7 +362,7 @@ def create_agent(
     name: str | None = None,
     **kwargs: Any,
 ) -> CompiledStateGraph:
-    """Create an  agent using LangChain's native ``create_langchain_agent``.
+    """Create an agent using LangChain's native ``create_langchain_agent``.
 
     This is intentionally a thin shim. Its only additional behavior is to
     construct declared subagents, install the same middleware stack on every
