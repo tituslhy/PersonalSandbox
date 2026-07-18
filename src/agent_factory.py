@@ -42,7 +42,10 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Callable, TypeAlias
+from functools import wraps
+
+import inspect
 
 from langchain.agents import create_agent as create_langchain_agent
 from langchain.agents.middleware import AgentMiddleware
@@ -50,7 +53,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import SystemMessage
 from langchain_core.tools import BaseTool, StructuredTool
 
-from langgraph.graph.state import CompiledStateGraph
+from langgraph.graph.state import StateGraph, CompiledStateGraph
 from langgraph.types import Checkpointer
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -66,7 +69,8 @@ __all__ = [
 
 ModelLike = str | BaseChatModel
 SystemPrompt = str | SystemMessage | None
-
+NodeFunction: TypeAlias = Callable[..., Any]
+NodeDecorator: TypeAlias = Callable[[NodeFunction], NodeFunction]
 
 # Add middleware that must always run on every agent here.
 #
@@ -414,3 +418,145 @@ def create_agent(
         name=_normalize_name(name) if name else None,
         **kwargs,
     )
+
+## Stubs ###
+def decorate_with_guardrail(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a node callable with the framework's guardrail hooks.
+
+    The returned wrapper preserves ``func``'s metadata and execution style: an
+    asynchronous callable receives an asynchronous wrapper, while a synchronous
+    callable receives a synchronous wrapper.
+
+    Args:
+        func:
+            Node callable to guard before and after invocation.
+
+    Returns:
+        A wrapped callable with the same synchronous or asynchronous execution
+        style as ``func``.
+    """
+    if inspect.iscoroutinefunction(func):
+        @wraps(func)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            # Guardrail before invocation
+            result = await func(*args, **kwargs)
+            # Guardrail after invocation
+            return result
+
+        return async_wrapper
+
+    @wraps(func)
+    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+        # Guardrail before invocation
+        result = func(*args, **kwargs)
+        # Guardrail after invocation
+        return result
+
+    return sync_wrapper
+
+COMPULSORY_DECORATORS: tuple[NodeDecorator, ...] = (
+    # decorate_with_otel,
+    # decorate_with_logging,
+)
+
+def apply_decorators(
+    func: NodeFunction,
+    decorators: Sequence[NodeDecorator],
+) -> NodeFunction:
+    # [otel, logging, guardrail] becomes:
+    # otel(logging(guardrail(func)))
+    for decorator in reversed(decorators):
+        func = decorator(func)
+
+    return func
+
+
+def decorate(
+    func: NodeFunction,
+    *,
+    with_guardrails: bool = False,
+)-> NodeFunction:
+    """
+    Apply required node decorators and optionally apply guardrails.
+
+    Compulsory decorators always wrap the node. When guardrails are requested,
+    the guardrail decorator is applied closest to the original node callable,
+    inside the compulsory decorators.
+
+    Args:
+        func:
+            Node callable to decorate.
+        guardrail_decorate:
+            Whether to additionally wrap ``func`` with the framework guardrail
+            decorator.
+
+    Returns:
+        The fully decorated node callable.
+    """
+    decorators = list(COMPULSORY_DECORATORS)
+
+    if with_guardrails:
+        decorators.append(decorate_with_guardrail)
+
+    return apply_decorators(func, decorators)
+
+def compile_state_graph(
+    builder: StateGraph,
+    nodes_to_decorate_with_guardrails: list[str],
+) -> CompiledStateGraph:
+    """Decorate registered node functions and compile a state graph.
+
+    The function mutates ``builder`` in place before compilation. Every
+    registered node exposing a synchronous ``func`` receives the compulsory
+    decorators. Nodes named in ``nodes_to_decorate_with_guardrails`` also
+    receive the guardrail decorator.
+
+    Args:
+        builder:
+            Fully constructed, uncompiled state graph containing all nodes and
+            edges.
+        nodes_to_decorate_with_guardrails:
+            Names of registered nodes that require guardrails in addition to
+            the compulsory decorators.
+
+    Returns:
+        The compiled LangGraph state graph.
+
+    Note:
+        Node decoration relies on LangGraph's current internal node
+        representation and therefore mutates each node runnable directly.
+    """
+    guarded_nodes = set(nodes_to_decorate_with_guardrails)
+    unknown_nodes = guarded_nodes.difference(builder.nodes)
+
+    if unknown_nodes:
+        raise ValueError(
+            f"Unknown nodes requested for guardrails: {sorted(unknown_nodes)}"
+        )
+
+    for node_name, node_spec in builder.nodes.items():
+        node_runnable = node_spec.runnable
+        with_guardrails = node_name in guarded_nodes
+
+        sync_func = getattr(node_runnable, "func", None)
+        async_func = getattr(node_runnable, "afunc", None)
+
+        if sync_func is None and async_func is None:
+            raise TypeError(
+                f"Node {node_name!r} is not a simple function node and "
+                "cannot be decorated at the function level."
+            )
+
+        if sync_func is not None:
+            node_runnable.func = decorate(
+                sync_func,
+                with_guardrails=with_guardrails,
+            )
+
+        if async_func is not None:
+            node_runnable.afunc = decorate(
+                async_func,
+                with_guardrails=with_guardrails,
+            )
+
+    return builder.compile()
