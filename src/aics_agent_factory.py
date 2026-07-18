@@ -1,0 +1,384 @@
+"""A thin, opinionated shim over LangChain's :func:`create_langchain_agent`.
+
+The module lets callers describe subagents declaratively with :class:`SubAgentSpec`.
+``create_agent`` then:
+
+1. Creates every subagent with LangChain's native ``create_langchain_agent``.
+2. Injects the same  middleware stack into every subagent.
+3. Wraps each subagent as an independent LangChain ``BaseTool``.
+4. Merges those subagent tools with ordinary tools.
+5. Creates the main/supervisor agent with the same middleware stack.
+
+Typical usage::
+
+    researcher = SubAgentSpec(
+        name="researcher",
+        description="Research technical questions and return grounded findings.",
+        model="anthropic:claude-sonnet-4-6",
+        system_prompt="You are a rigorous technical researcher.",
+        tools=[web_search_tool],
+    )
+
+    supervisor = create_agent(
+        model="anthropic:claude-opus-4-6",
+        system_prompt="Delegate specialist work to the appropriate subagent.",
+        tools=[calculator_tool],
+        subagents=[researcher],
+        middleware=[observability_middleware, guardrail_middleware],
+        name="supervisor",
+    )
+
+Add middleware that must always be present to :data:`CORE_MIDDLEWARE`. Middleware
+passed to ``create_agent`` is appended to that required stack and is also
+applied to every generated subagent.
+
+Important:
+    The same middleware objects are supplied to the main agent and its
+    subagents. Middleware instances should therefore be stateless or safe for
+    concurrent/re-entrant use.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Sequence
+from typing import Any
+
+from langchain.agents import create_agent as create_langchain_agent
+from langchain.agents.middleware.types import AgentMiddleware
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import SystemMessage
+from langchain_core.tools import BaseTool, StructuredTool
+
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Checkpointer
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+__all__ = [
+    "CORE_MIDDLEWARE",
+    "SubAgentSpec",
+    "create_agent",
+    "merge_tools_and_subagents",
+    "wrap_subagent_as_tool",
+]
+
+
+ModelLike = str | BaseChatModel
+SystemPrompt = str | SystemMessage | None
+
+
+# Add middleware that must always run on every  agent here.
+#
+# Example:
+#
+# from core.middleware import AuditMiddleware, GuardrailMiddleware
+#
+# CORE_MIDDLEWARE: tuple[AgentMiddleware, ...] = (
+#     AuditMiddleware(),
+#     GuardrailMiddleware(),
+# )
+#
+CORE_MIDDLEWARE: tuple[AgentMiddleware, ...] = ()
+
+
+_RESERVED_AGENT_KWARGS = frozenset(
+    {
+        "model",
+        "tools",
+        "system_prompt",
+        "middleware",
+        "name",
+    }
+)
+
+class SubAgentSpec(BaseModel):
+    """Declarative configuration for a generated LangChain subagent.
+    The  shim creates the subagent with LangChain's ``create_langchain_agent``,
+    injects the shared and subagent-specific middleware, and exposes the
+    resulting agent as a tool to the main agent.
+    Attributes:
+        name:
+            Name used for the generated LangChain agent and subagent tool.
+        description:
+            Tool description shown to the supervising agent. It should explain
+            what the subagent does and when it should be used.
+        model:
+            Model identifier or initialized LangChain chat model.
+        system_prompt:
+            System prompt supplied to the subagent.
+        tools:
+            Tools available only to this subagent.
+        middleware:
+            Middleware applied only to this subagent, after the shared 
+            middleware stack.
+        agent_kwargs:
+            Additional keyword arguments forwarded to LangChain's
+            ``create_langchain_agent`` when constructing this subagent.
+    """
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        extra="forbid",
+    )
+    name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    model: ModelLike
+    system_prompt: SystemPrompt = None
+    tools: list[BaseTool] = Field(default_factory=list)
+    middleware: list[AgentMiddleware] = Field(default_factory=list)
+    checkpointer: Checkpointer | True | False | None = Field(default_factory=None)
+    agent_kwargs: dict[str, Any] = Field(default_factory=dict)    
+
+    @field_validator("name", "description")
+    @classmethod
+    def validate_non_blank_text(cls, value: str) -> str:
+        """Reject blank names and descriptions and trim outer whitespace."""
+        value = value.strip()
+        if not value:
+            raise ValueError("Value must not be blank.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_agent_kwargs(self) -> SubAgentSpec:
+        """Ensure shim-owned arguments are not supplied through agent_kwargs."""
+        reserved_keys = _RESERVED_AGENT_KWARGS.intersection(
+            self.agent_kwargs
+        )
+        if reserved_keys:
+            joined = ", ".join(sorted(reserved_keys))
+            raise ValueError(
+                "agent_kwargs contains shim-managed keys: "
+                f"{joined}. Use the corresponding SubAgentSpec fields instead."
+            )
+        return self
+
+def _normalize_name(name: str) -> str:
+    """Convert an arbitrary agent name into a safe snake-case identifier.
+    Args:
+        name:
+            Raw human-readable name.
+    Returns:
+        A non-empty lowercase identifier containing letters, digits, and
+        underscores.
+    Raises:
+        ValueError:
+            If no usable characters remain after normalization.
+    """
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", name).strip("_").lower()
+    if not normalized:
+        raise ValueError(
+            f"Agent name {name!r} does not contain any usable characters."
+        )
+    if normalized[0].isdigit():
+        normalized = f"agent_{normalized}"
+    return normalized
+
+def _effective_middleware(
+    middleware: Sequence[AgentMiddleware] | None,
+) -> tuple[AgentMiddleware, ...]:
+    """Combine mandatory core middleware with call-specific middleware."""
+    return (*CORE_MIDDLEWARE, *(middleware or ()))
+
+
+def _create_subagent(
+    spec: SubAgentSpec,
+    *,
+    middleware: Sequence[AgentMiddleware],
+) -> CompiledStateGraph:
+    """Create one subagent directly with LangChain's ``create_langchain_agent``.
+
+    Args:
+        spec:
+            Declarative subagent configuration.
+        middleware:
+            The complete middleware stack shared by the supervisor and every
+            generated subagent.
+
+    Returns:
+        A compiled LangChain agent graph.
+    """
+    safe_name = _normalize_name(spec.name)
+
+    return create_langchain_agent(
+        model=spec.model,
+        tools=list(spec.tools),
+        system_prompt=spec.system_prompt,
+        middleware=list(middleware),
+        checkpointer=spec.checkpointer,
+        name=safe_name,
+        **dict(spec.agent_kwargs),
+    )
+
+def wrap_subagent_as_tool(
+    spec: SubAgentSpec,
+    subagent: CompiledStateGraph,
+) -> BaseTool:
+    """Wrap an already-created subagent as a LangChain structured tool.
+
+    Both synchronous and asynchronous execution are supported. The supervisor
+    sees only one string argument, ``question``, together with the name and
+    description generated from the ``SubAgentSpec``.
+
+    Args:
+        spec:
+            Specification containing the exposed tool name and description.
+        subagent:
+            Agent produced by LangChain's ``create_langchain_agent``.
+
+    Returns:
+        A ``BaseTool`` that invokes the subagent and returns its final response.
+    """
+    safe_name = _normalize_name(spec.name)
+    tool_name = f"invoke_{safe_name}"
+
+    def invoke_subagent(question: str) -> str:
+        """Delegate a question to the configured specialist subagent."""
+        result = subagent.invoke(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": question,
+                    }
+                ]
+            }
+        )
+        return result["messages"][-1].content
+
+    async def ainvoke_subagent(question: str) -> str:
+        """Delegate a question to the configured specialist asynchronously."""
+        result = await subagent.ainvoke(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": question,
+                    }
+                ]
+            }
+        )
+        return result["messages"][-1].content
+
+    return StructuredTool.from_function(
+        func=invoke_subagent,
+        coroutine=ainvoke_subagent,
+        name=tool_name,
+        description=spec.description,
+    )
+
+def _validate_unique_tool_names(tools: Sequence[BaseTool]) -> None:
+    """Raise when ordinary and generated tools expose duplicate names."""
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+
+    for tool in tools:
+        if tool.name in seen:
+            duplicates.add(tool.name)
+        seen.add(tool.name)
+
+    if duplicates:
+        joined = ", ".join(sorted(duplicates))
+        raise ValueError(f"Duplicate tool names are not allowed: {joined}.")
+
+
+def merge_tools_and_subagents(
+    tools: Sequence[BaseTool] | None = None,
+    subagents: Sequence[SubAgentSpec] | None = None,
+    *,
+    middleware: Sequence[AgentMiddleware] = (),
+) -> list[BaseTool]:
+    """Create subagents, wrap them as tools, and merge them with normal tools.
+
+    Subagents are created with LangChain's native ``create_langchain_agent`` rather than
+    recursively calling ``create_agent``. This keeps the public shim thin
+    while still guaranteeing that the supplied middleware is installed on
+    every generated subagent.
+
+    Args:
+        tools:
+            Ordinary tools available directly to the main agent.
+        subagents:
+            Declarative specifications for specialist subagents.
+        middleware:
+            Complete middleware stack to inject into every subagent.
+
+    Returns:
+        A new list containing ordinary tools followed by generated subagent
+        tools.
+
+    Raises:
+        ValueError:
+            If two resulting tools have the same name.
+    """
+    merged_tools = list(tools or ())
+
+    for spec in subagents or ():
+        subagent = _create_subagent(spec, middleware=middleware)
+        merged_tools.append(wrap_subagent_as_tool(spec, subagent))
+
+    _validate_unique_tool_names(merged_tools)
+    return merged_tools
+
+
+def create_agent(
+    model: ModelLike,
+    tools: Sequence[BaseTool] | None = None,
+    *,
+    subagents: Sequence[SubAgentSpec] | None = None,
+    system_prompt: SystemPrompt = None,
+    middleware: Sequence[AgentMiddleware] | None = None,
+    name: str | None = None,
+    **kwargs: Any,
+) -> CompiledStateGraph:
+    """Create an  agent using LangChain's native ``create_langchain_agent``.
+
+    This is intentionally a thin shim. Its only additional behavior is to
+    construct declared subagents, install the same middleware stack on every
+    agent, wrap the subagents as tools, and merge those tools with the ordinary
+    tool list.
+
+    Args:
+        model:
+            LangChain model identifier or initialized ``BaseChatModel`` for the
+            main agent.
+        tools:
+            Ordinary tools exposed directly to the main agent.
+        subagents:
+            Declarative subagents to create and expose as separate tools.
+        system_prompt:
+            System prompt for the main agent.
+        middleware:
+            Additional middleware applied to both the main agent and every
+            generated subagent. Mandatory middleware from
+            :data:`CORE_MIDDLEWARE` is prepended automatically.
+        name:
+            Optional LangChain name for the main agent.
+        **kwargs:
+            All remaining arguments are forwarded unchanged to LangChain's
+            ``create_langchain_agent``.
+
+    Returns:
+        The compiled LangChain agent graph.
+
+    Notes:
+        ``SubAgentSpec.agent_kwargs`` configures individual subagents. Keyword
+        arguments passed directly to this function configure only the main
+        agent, except for ``middleware``, which is intentionally shared with
+        all generated subagents.
+    """
+    effective_middleware = _effective_middleware(middleware)
+
+    merged_tools = merge_tools_and_subagents(
+        tools=tools,
+        subagents=subagents,
+        middleware=effective_middleware,
+    )
+
+    return create_langchain_agent(
+        model=model,
+        tools=merged_tools,
+        system_prompt=system_prompt,
+        middleware=list(effective_middleware),
+        name=_normalize_name(name) if name else None,
+        **kwargs,
+    )
