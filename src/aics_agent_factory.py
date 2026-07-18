@@ -176,11 +176,31 @@ def _normalize_name(name: str) -> str:
         normalized = f"agent_{normalized}"
     return normalized
 
+def _combine_middleware(
+    *groups: Sequence[AgentMiddleware],
+) -> tuple[AgentMiddleware, ...]:
+    """Combine ordered middleware groups and reject ambiguous name collisions."""
+    combined: list[AgentMiddleware] = []
+    middleware_by_name: dict[str, AgentMiddleware] = {}
+
+    for group in groups:
+        for item in group:
+            if item.name not in middleware_by_name:
+                middleware_by_name[item.name] = item
+                combined.append(item)
+            elif middleware_by_name[item.name] is not item:
+                raise ValueError(
+                    f"Middleware name {item.name!r} is used by multiple instances."
+                )
+
+    return tuple(combined)
+
+
 def _effective_middleware(
     middleware: Sequence[AgentMiddleware] | None,
 ) -> tuple[AgentMiddleware, ...]:
     """Combine mandatory core middleware with call-specific middleware."""
-    return (*CORE_MIDDLEWARE, *(middleware or ()))
+    return _combine_middleware(CORE_MIDDLEWARE, middleware or ())
 
 
 def _create_subagent(
@@ -201,12 +221,13 @@ def _create_subagent(
         A compiled LangChain agent graph.
     """
     safe_name = _normalize_name(spec.name)
+    subagent_middleware = _combine_middleware(middleware, spec.middleware)
 
     return create_langchain_agent(
         model=spec.model,
         tools=list(spec.tools),
         system_prompt=spec.system_prompt,
-        middleware=list(middleware),
+        middleware=list(subagent_middleware),
         checkpointer=spec.checkpointer,
         name=safe_name,
         **dict(spec.agent_kwargs),
