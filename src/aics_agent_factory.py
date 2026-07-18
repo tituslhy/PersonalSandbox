@@ -45,7 +45,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from langchain.agents import create_agent as create_langchain_agent
-from langchain.agents.middleware.types import AgentMiddleware
+from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import SystemMessage
 from langchain_core.tools import BaseTool, StructuredTool
@@ -88,6 +88,7 @@ _RESERVED_AGENT_KWARGS = frozenset(
         "tools",
         "system_prompt",
         "middleware",
+        "checkpointer",
         "name",
     }
 )
@@ -126,7 +127,9 @@ class SubAgentSpec(BaseModel):
     system_prompt: SystemPrompt = None
     tools: list[BaseTool] = Field(default_factory=list)
     middleware: list[AgentMiddleware] = Field(default_factory=list)
-    checkpointer: Checkpointer | True | False | None = Field(default_factory=None)
+    # Use True to inherit the parent graph's checkpointer when this subagent is
+    # invoked as a tool.
+    checkpointer: Checkpointer = None
     agent_kwargs: dict[str, Any] = Field(default_factory=dict)    
 
     @field_validator("name", "description")
