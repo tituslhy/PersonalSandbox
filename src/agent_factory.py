@@ -1,13 +1,20 @@
-"""A thin, opinionated shim over LangChain's :func:`create_langchain_agent`.
+"""Factories for creating opinionated LangChain agents and LangGraph workflows.
 
-The module lets callers describe subagents declaratively with :class:`SubAgentSpec`.
-``create_agent`` then:
+The module provides two related framework entry points:
 
-1. Creates every subagent with LangChain's native ``create_langchain_agent``.
-2. Injects the same  middleware stack into every subagent.
+* :func:`create_agent` builds a supervisor agent from ordinary tools and
+  declaratively configured subagents.
+* :func:`compile_state_graph` applies required decorators to the nodes of a
+  fully constructed ``StateGraph`` before compiling it.
+
+Callers describe subagents with :class:`SubAgentSpec`. :func:`create_agent`
+then:
+
+1. Creates each subagent with LangChain's native ``create_agent``.
+2. Injects the framework and caller middleware into every subagent.
 3. Wraps each subagent as an independent LangChain ``BaseTool``.
-4. Merges those subagent tools with ordinary tools.
-5. Creates the main/supervisor agent with the same middleware stack.
+4. Merges the subagent tools with the supervisor's ordinary tools.
+5. Creates the supervisor agent with the same shared middleware stack.
 
 Typical usage::
 
@@ -28,14 +35,43 @@ Typical usage::
         name="supervisor",
     )
 
-Core middleware in :data:`CORE_MIDDLEWARE` is mandatory. Caller middleware
-passed to ``create_agent`` is additive: it is appended to the required stack
-and applied to every generated subagent.
+Compiling a custom StateGraph with framework middleware::
+
+    builder = StateGraph(State)
+    builder.add_node("retrieve_context", retrieve_context)
+    builder.add_node("call_model", call_model)
+    builder.add_edge(START, "retrieve_context")
+    builder.add_edge("retrieve_context", "call_model")
+    builder.add_edge("call_model", END)
+
+    graph = compile_state_graph(
+        builder,
+        nodes_to_decorate_with_guardrails=["call_model"],
+    )
+
+The supplied ``StateGraph`` must already contain all of its nodes and edges and
+must not have been compiled. :func:`compile_state_graph` applies the compulsory
+framework middleware decorators to every supported node function. It also
+applies guardrail middleware to the named nodes, which should generally be the
+nodes that invoke an LLM. The decorated builder is then compiled and returned
+as a ``CompiledStateGraph``.
+
+Agent middleware in :data:`CORE_MIDDLEWARE` is mandatory. Caller middleware
+passed to :func:`create_agent` is additive: it is appended to the required
+stack and shared by the supervisor and every generated subagent.
+
+StateGraph middleware is implemented by decorating the registered node
+functions immediately before compilation. The operation mutates the supplied
+builder in place; it does not add, remove, or reconnect nodes and edges.
 
 Important:
     The same middleware objects are supplied to the main agent and its
     subagents. Middleware instances should therefore be stateless or safe for
     concurrent/re-entrant use.
+
+    State-graph node decoration relies on LangGraph's current internal node
+    representation. Supported LangGraph versions should be constrained and
+    both synchronous and asynchronous execution paths should be tested.
 """
 
 from __future__ import annotations
