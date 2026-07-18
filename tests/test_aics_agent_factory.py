@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import unittest
 import asyncio
+import unittest
 from typing import Any, cast
 from unittest.mock import patch
 
