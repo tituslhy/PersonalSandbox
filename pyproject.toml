@@ -13,6 +13,7 @@ dependencies = [
     "langgraph>=1.2.6",
     "mypy>=2.3.0",
     "openai>=2.44.0",
+    "pageindex>=0.4.4",
     "python-dotenv>=1.2.2",
     "ruff>=0.15.22",
 ]
